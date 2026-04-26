@@ -4,7 +4,7 @@ from typing import Annotated, AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
@@ -15,6 +15,9 @@ from app.services.storage import upload_ciphertext, download_ciphertext_stream
 
 router = APIRouter(prefix="/files", tags=["Files"])
 
+# 100 MB hard ceiling in bytes
+_QUOTA_BYTES = 104_857_600
+
 
 # ── Pydantic Schemas ─────────────────────────────────────────────────────────
 
@@ -22,12 +25,15 @@ class FileUploadResponse(BaseModel):
     file_id: uuid.UUID
     filename: str
     cloud_url: str
+    file_size: int
     message: str = "File encrypted and uploaded successfully."
+
 
 class FileMetaResponse(BaseModel):
     file_id: uuid.UUID
     filename: str
     cloud_url: str
+    file_size: int
     is_quarantined: bool
 
     model_config = {"from_attributes": True}
@@ -36,21 +42,26 @@ class FileMetaResponse(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _object_key(user_id: uuid.UUID, file_id: uuid.UUID, filename: str) -> str:
-    """
-    Builds a deterministic S3 object key scoped to the owning user.
-    Layout: users/<user_id>/files/<file_id>/<filename>
-    Prevents any possibility of cross-user key collisions.
-    """
     return f"users/{user_id}/files/{file_id}/{filename}"
 
 
+async def _get_used_storage(user_id: uuid.UUID, db: AsyncSession) -> int:
+    """
+    Issues a single SUM() aggregate to Postgres instead of fetching all
+    file rows and summing in Python. Crucial for correctness at scale —
+    a user with 10,000 files should not cause 10,000 rows to be
+    transferred over the wire just to enforce a quota.
+
+    Returns 0 if the user has no files yet (coalesce handles NULL).
+    """
+    result = await db.execute(
+        select(func.coalesce(func.sum(FileModel.file_size), 0))
+        .where(FileModel.user_id == user_id)
+    )
+    return int(result.scalar_one())
+
+
 async def _collect_stream(stream: AsyncGenerator[bytes, None]) -> bytes:
-    """
-    Fully buffers an async byte stream into memory.
-    Used only on download where we must decrypt the full ciphertext
-    before returning plaintext — GCM tag verification requires the
-    entire payload.
-    """
     chunks: list[bytes] = []
     async for chunk in stream:
         chunks.append(chunk)
@@ -70,15 +81,21 @@ async def upload_file(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> FileUploadResponse:
     """
-    Pipeline:
-      1. Read raw bytes from multipart upload.
-      2. Encrypt with AES-256-GCM (fresh key per file).
-      3. Upload ciphertext to S3/R2.
-      4. Persist file metadata + AES key to Postgres.
+    Upload pipeline with quota enforcement:
 
-    The AES key never leaves the DB unencrypted — Module 5 (KMS wrapping)
-    will add envelope encryption on top of this column.
+      0. Read Content-Length header for a cheap pre-flight size check.
+      1. Read raw bytes — required before we can encrypt or know exact size.
+      2. Quota gate: SUM(existing file_size) + incoming size vs 100 MB ceiling.
+      3. Encrypt with AES-256-GCM.
+      4. Upload ciphertext to S3/R2.
+      5. Persist metadata including file_size to Postgres.
+
+    Quota is checked AFTER reading bytes (step 2) because multipart uploads
+    do not guarantee a reliable Content-Length header. We use the actual
+    byte count as the source of truth.
     """
+
+    # Step 1 — Read raw bytes
     raw_bytes: bytes = await file.read()
 
     if not raw_bytes:
@@ -87,17 +104,31 @@ async def upload_file(
             detail="Uploaded file is empty.",
         )
 
-    # Step 1 — Encrypt
+    incoming_size: int = len(raw_bytes)
+
+    # Step 2 — Quota gate (single async DB aggregate — never blocks the loop)
+    used_bytes = await _get_used_storage(current_user.id, db)
+
+    if used_bytes + incoming_size > _QUOTA_BYTES:
+        remaining = max(_QUOTA_BYTES - used_bytes, 0)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Storage quota exceeded. "
+                f"You have {remaining:,} bytes remaining of your "
+                f"{_QUOTA_BYTES:,} byte (100 MB) quota."
+            ),
+        )
+
+    # Step 3 — Encrypt
     ciphertext, aes_key = encrypt_file(raw_bytes)
 
-    # Step 2 — Build a stable S3 key before upload so it can be stored in DB
+    # Step 4 — Upload ciphertext to S3/R2
     file_id = uuid.uuid4()
     object_key = _object_key(current_user.id, file_id, file.filename or "unnamed")
-
-    # Step 3 — Upload ciphertext; raises HTTP 502 on failure
     cloud_url = await upload_ciphertext(object_key, ciphertext)
 
-    # Step 4 — Persist metadata; DB commit is handled by get_db() context manager
+    # Step 5 — Persist metadata
     file_record = FileModel(
         id=file_id,
         user_id=current_user.id,
@@ -105,6 +136,7 @@ async def upload_file(
         cloud_url=cloud_url,
         aes_key=aes_key,
         is_quarantined=False,
+        file_size=incoming_size,       # raw bytes, not ciphertext size
     )
     db.add(file_record)
     await db.flush()
@@ -113,6 +145,7 @@ async def upload_file(
         file_id=file_record.id,
         filename=file_record.filename,
         cloud_url=file_record.cloud_url,
+        file_size=file_record.file_size,
     )
 
 
@@ -123,49 +156,38 @@ async def download_file(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> StreamingResponse:
     """
-    Pipeline:
-      1. Fetch file record from DB — 404 if not found.
-      2. Ownership check — 403 if the requesting user does not own it.
-      3. Quarantine gate — 403 if flagged by the threat scanner.
-      4. Fetch ciphertext stream from S3/R2.
-      5. Buffer + decrypt with stored AES key.
-      6. Stream plaintext back to client.
+    Download pipeline (unchanged from Module 3 except FileModel now carries file_size):
 
-    Security ordering is intentional: ownership is verified before
-    quarantine status to avoid leaking whether a file_id exists at all
-    to non-owners.
+      1. Fetch file record — 404 if missing.
+      2. Ownership gate — 403 if not owner.
+      3. Quarantine gate — 403 if flagged.
+      4. Fetch + buffer ciphertext from S3/R2.
+      5. Decrypt with stored AES key.
+      6. Stream plaintext back to client.
     """
-    # Step 1 — Fetch record
     result = await db.execute(
         select(FileModel).where(FileModel.id == file_id)
     )
     file_record: FileModel | None = result.scalar_one_or_none()
 
     if file_record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found.",
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
 
-    # Step 2 — Ownership gate
     if file_record.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have permission to access this file.",
         )
 
-    # Step 3 — Quarantine gate
     if file_record.is_quarantined:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This file has been quarantined and cannot be downloaded.",
         )
 
-    # Step 4 — Reconstruct object key and fetch ciphertext
     object_key = _object_key(file_record.user_id, file_record.id, file_record.filename)
     ciphertext = await _collect_stream(download_ciphertext_stream(object_key))
 
-    # Step 5 — Decrypt; raises HTTP 422 on tag mismatch / tampering
     try:
         plaintext = decrypt_file(ciphertext, file_record.aes_key)
     except Exception as exc:
@@ -174,9 +196,8 @@ async def download_file(
             detail=f"File decryption failed. The file may be corrupted: {exc}",
         )
 
-    # Step 6 — Stream plaintext to client
     async def plaintext_generator() -> AsyncGenerator[bytes, None]:
-        chunk_size = 1024 * 256  # 256 KB chunks
+        chunk_size = 1024 * 256
         for i in range(0, len(plaintext), chunk_size):
             yield plaintext[i : i + chunk_size]
 
@@ -195,12 +216,26 @@ async def list_my_files(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> list[FileMetaResponse]:
-    """
-    Returns metadata for all files owned by the authenticated user.
-    AES keys are never included in any list or detail response.
-    """
     result = await db.execute(
         select(FileModel).where(FileModel.user_id == current_user.id)
     )
     files = result.scalars().all()
     return [FileMetaResponse.model_validate(f) for f in files]
+
+
+@router.get("/storage-usage")
+async def storage_usage(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """
+    Returns the user's current storage consumption against their quota.
+    Cheap aggregate query — no file rows transferred.
+    """
+    used = await _get_used_storage(current_user.id, db)
+    return {
+        "used_bytes": used,
+        "quota_bytes": _QUOTA_BYTES,
+        "remaining_bytes": max(_QUOTA_BYTES - used, 0),
+        "used_percent": round((used / _QUOTA_BYTES) * 100, 2),
+    }
